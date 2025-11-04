@@ -1,0 +1,69 @@
+# This multi-stage dockerfile is used to build all lightgbm related artifacts 
+# for a given ROCm version and AMD GPU target.
+# The python wheel artifacts will be variant wheels, with the variants
+# defined as wheel file metadata. The wheel files generated are expected to be
+# installed with uv pip, so the variants are honored during install time.
+# The python version to build against will be a build argument, along with the
+# ROCm version and AMD GPU target.
+
+# This build will be based on manylinux_2_28_x86_64 image.
+
+# This dockerfile will have the following stages:
+
+# Stage 1: Start with a manylinux_2_28_x86_64 image, install ROCm.
+# Stage 2: Install all packages used in the build process. For C++ based build
+#          we will be using the build tools provided by the manylinux image.
+# Stage 3: For the given ROCm version, AMD GPU target and python version, build
+#          the LightGBM C++ library and then the python package, embedding the
+#          variant metadata into the package itself.
+# Stage 4: Build a tester image that will include the built artifacts, the unit
+#          tests and the examples.
+
+# The docker build is expected to be executed from the root of repository
+
+# Stage 1: Start with a manylinux_2_28_x86_64 image, install ROCm.
+ARG BASE_IMAGE=quay.io/pypa/manylinux_2_28_x86_64
+FROM ${BASE_IMAGE} AS base
+
+ARG ROCM_INSTALLER_URL=https://repo.radeon.com/amdgpu-install/7.0.2/rhel/8.10/amdgpu-install-7.0.2.70002-1.el8.noarch.rpm
+ARG AMD_GPU_TARGET=gfx942
+ARG PYTHON_VERSION=3.11
+
+# Download ROCm Installer, install it
+RUN dnf install -y ${ROCM_INSTALLER_URL} && \
+    dnf install -y rocm && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf && \
+    echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && \
+    echo "/opt/rocm/lib64" >> /etc/ld.so.conf.d/rocm.conf && \
+    ldconfig
+
+# Stage 2: Install any required build tools. 
+FROM base AS lightgbm-base-builder
+RUN dnf install -y gcc-c++ libstdc++-devel boost-devel ocl-icd-devel && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf
+
+# Stage 3: Copy sources and build the C++ library
+FROM lightgbm-base-builder AS lightgbm-builder
+
+# Prepare source and build directories
+RUN mkdir -p /src/lightgbm /build
+COPY . /src/lightgbm
+
+# ROCm configuration variables - write to /etc/profile.d for persistence
+RUN echo 'export ROCM_PATH=/opt/rocm' >> /etc/profile.d/rocm-env.sh && \
+    echo '[ -n "${PATH}" ] && export PATH=${ROCM_PATH}/bin:${PATH} || export PATH=${ROCM_PATH}/bin' >> /etc/profile.d/rocm-env.sh && \
+    echo '[ -n "${LD_LIBRARY_PATH}" ] && export LD_LIBRARY_PATH=${ROCM_PATH}/lib:${ROCM_PATH}/lib64:${LD_LIBRARY_PATH} || export LD_LIBRARY_PATH=${ROCM_PATH}/lib:${ROCM_PATH}/lib64' >> /etc/profile.d/rocm-env.sh && \
+    echo '[ -n "${CMAKE_PREFIX_PATH}" ] && export CMAKE_PREFIX_PATH=${ROCM_PATH}/lib/cmake:${CMAKE_PREFIX_PATH} || export CMAKE_PREFIX_PATH=${ROCM_PATH}/lib/cmake' >> /etc/profile.d/rocm-env.sh && \
+    chmod +x /etc/profile.d/rocm-env.sh
+
+ENV LIGHTGBM_SRC_DIR=/src/lightgbm
+ENV LIGHTGBM_BUILD_DIR=/build
+
+# Build the C++ library
+RUN cmake -DUSE_HIP=ON -DBUILD_CPP_TEST=ON -B $LIGHTGBM_BUILD_DIR -S $LIGHTGBM_SRC_DIR -DCMAKE_HIP_ARCHITECTURES=${AMDGPU_TARGETS} && \
+    cd ${LIGHTGBM_BUILD_DIR} && \
+    make -j$(nproc)
+
+# Build the python package
